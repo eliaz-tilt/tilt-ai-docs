@@ -1,262 +1,243 @@
 # PIE-121: Human-Readable Benefit Reasoning — Implementation Plan
 
-> **Privacy:** This file lives in `ai-docs/`, which is **gitignored and not
-> uploaded to GitHub**. Use it for local agent handoffs only; do not copy into
-> `.ai/` or commit it.
+> **Privacy:** This file lives in `ai-docs/`, which is listed in the repo `.gitignore` (alongside `AGENTS.local.md`) and is **not uploaded to GitHub**. Use it for local agent handoffs only; do not copy into `.ai/` or commit it.
 
-**Ticket:** Format Dates as Human-Readable and Remove Python Object
-Representations\
-**Branch:** `pie-121-humanize-span-messages`\
-**PR:** [#11928](https://github.com/ourtilt/tilt-repo/pull/11928)\
-**Status (2026-09-15):** ~95% complete on branch; gap-fill commit landed; CI
-re-running after main merge.
+**Ticket:** Format Dates as Human-Readable and Remove Python Object Representations  
+**Branch:** `pie-121-humanize-span-messages`  
+**PR:** [#11928](https://github.com/ourtilt/tilt-repo/pull/11928)  
+**Status (2026-09-15):** Framework and most rule copy done on branch; **Maine PFML** still leaks ISO dates; verify CI + merge.
+
+> **Important:** `main` does **not** include this work. Always `git checkout pie-121-humanize-span-messages` before auditing or editing.
 
 ---
 
 ## Executive summary
 
-Most of this ticket is **already implemented** on
-`pie-121-humanize-span-messages`. Do **not** create a new
-`backend/benefits/utils/formatting.py` — the shared utilities live in
-**`backend/benefits/rules/reasoning_format.py`**, with canonical date formatting
-delegated to **`backend/benefits/rules/checks/messages.format_leave_date`**
-(Django `date_format(value, "F j, Y")` → e.g. "August 19, 2024").
+Most of PIE-121 is **already implemented** on `pie-121-humanize-span-messages`. Do **not** create `backend/benefits/utils/formatting.py` — shared utilities live in **`backend/benefits/rules/reasoning_format.py`**, with canonical date formatting in **`backend/benefits/rules/checks/messages.format_leave_date`** (Django `date_format(value, "F j, Y")` → e.g. "August 19, 2024").
 
-The remaining work is **verification, small gaps, and PR merge readiness** — not
-a greenfield rewrite.
+Remaining work is **small gap fixes + verification + PR merge** — not a greenfield rewrite.
+
+| Area | Feature branch status |
+|------|----------------------|
+| `reasoning_format.py` + framework hooks | ✅ Done |
+| `__init__.py` span calculation / schedule-block reasoning | ✅ Done (zero `.isoformat()` on branch) |
+| State rule files (~40 modules) | ✅ Done |
+| Legacy FMLA `eligibility_desc` | ✅ Done (`_format_long_date`) |
+| Frontend structured spans + mocks | ✅ Done |
+| **Maine PFML** parental min/max start reasoning | ❌ **3 ISO date leaks** |
+| Paycalc operator arithmetic reasoning | ⚠️ Uses raw `str(Decimal)` (mostly internal) |
+| PR CI / merge | 🔄 In progress |
 
 ---
 
-## Architecture (what exists today)
+## Architecture (what exists on the branch)
 
 ### Central formatting module
 
-| Helper                                    | Purpose                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------- |
-| `format_leave_date(date)`                 | Re-exports `checks.messages.format_leave_date`                       |
-| `format_effective_date(date)`             | Hides sentinel dates as "Not applicable"                             |
-| `format_leave_date_range(start, end)`     | "October 10, 2023 to December 4, 2023"                               |
-| `format_span_range(span)`                 | Span-like objects; handles `date.min` unknown spans                  |
-| `format_span_list(spans)`                 | Newline-separated ranges                                             |
-| `format_span_output_message(desc, spans)` | Final spans reasoning (Approved/Continuous/Intermittent prefixes)    |
-| `format_expression_result(desc, result)`  | Non-boolean expression results (dates, spans, timedeltas)            |
-| `format_duration(timedelta)`              | "105 days" (no `0:00:00`)                                            |
-| `days_to_weeks_phrase(days)`              | "6 weeks" when divisible by 7                                        |
-| `is_sentinel_date(date)`                  | `year < 1900`                                                        |
-| `should_suppress_reason(message)`         | Filters intermediate messages containing `0001-01-01` / `9999-12-31` |
-| 100+ `format_*_message()` helpers         | Program-specific copy in `reasoning_format.py`                       |
+| Helper | Purpose |
+|--------|---------|
+| `format_leave_date(date)` | Re-exports `checks.messages.format_leave_date` |
+| `format_effective_date(date)` | Sentinel dates → **"Not applicable"** |
+| `format_leave_date_range(start, end)` | "October 10, 2023 to December 4, 2023" |
+| `format_span_range(span)` | Span-like objects; `date.min` → unknown-span message |
+| `format_span_list(spans)` | Newline-separated ranges |
+| `format_span_output_message(desc, spans)` | Final spans reasoning (Approved/Continuous/Intermittent prefixes) |
+| `format_expression_result(desc, result)` | Non-boolean expression results |
+| `format_duration(timedelta)` | "105 days" (no `0:00:00`) |
+| `days_to_weeks_phrase(days)` | "6 weeks" when divisible by 7 |
+| `is_sentinel_date(date)` | `year < 1900` |
+| `should_suppress_reason(message)` | Drops messages containing `0001-01-01` / `9999-12-31` |
+| 100+ `format_*_message()` helpers | Program-specific copy |
 
-### Framework choke points (already wired)
+### Framework choke points (wired on branch)
 
-1. **`BaseRule.__call_compute`** (`backend/benefits/rules/__init__.py`
-   ~L641–666)\
-   Non-boolean expression results automatically go through
-   `format_expression_result()`.
-
-2. **`BaseRule.spans()`** (~L2271–2277)\
-   Final span output uses `format_span_output_message()` via `_final_reason()`.
-
-3. **`BaseRule.reason()`** (~L723–734)\
-   Calls `should_suppress_reason()` to drop sentinel-date noise.
-
-4. **`benefits/services/results.py`**\
-   Filters internal categories (`paycalc_item_template_overrides`,
-   `approval_document_config`) and internal message patterns from user-facing
-   reasoning.
+1. **`BaseRule.__call_compute`** (~L664–665) — non-boolean results → `format_expression_result()`
+2. **`BaseRule.spans()`** (~L2271–2277) — final output → `format_span_output_message()` via `_final_reason()`
+3. **`BaseRule.reason()`** (~L731–733) — `should_suppress_reason()` filter
+4. **`ResultSerializer.get_reasoning()`** → `get_user_facing_reasoning()` in `benefits/services/results.py` — API boundary; filters internal categories and debug patterns
+5. **`calculate_spans()` schedule-block paths** in `__init__.py` — use `format_schedule_block_*`, `format_max_duration_*`, `format_no_overlap_*` helpers (not `.isoformat()`)
 
 ### Legacy FMLA
 
-`backend/legacy/fmla.py` uses `_format_long_date()` (same Django format) in
-`_hire_date_eligibility_message()`. Gap-fill commit updated hire-date copy;
-tests updated in `backend/legacy/tests/test_fmla.py`.
+`backend/legacy/fmla.py` uses `_format_long_date()` for `eligibility_desc`. API `to_dict()` still uses `.isoformat()` for machine-readable JSON fields — **out of scope** unless product asks to change API date shape.
 
-### Frontend companion work (same PR)
+### Frontend (same PR)
 
-- `frontend/client/utils/date-span-processor/date-span-processor.ts` — prefers
-  structured `result.spans` VM data; falls back to legacy regex parsing of
-  reasoning text.
-- `frontend/client/utils/benefit-span-reasoning/format-empty-span-summary.ts` —
-  updated for human-readable span summaries.
-- Mocks updated in `__mocks__/AdminPDP/benefitData.ts`,
-  `formattedBenefitsForDisplay.ts`.
+- `date-span-processor.ts` — prefers structured `result.spans`; regex fallback only parses legacy `datetime.date(YYYY,M,D)` tuples
+- `format-empty-span-summary.ts` — parses dates in parentheses; update tests if overlap-message format changes
+- Mocks: `__mocks__/AdminPDP/benefitData.ts`, `formattedBenefitsForDisplay.ts`
 
 ---
 
-## Issue-by-issue status
+## Issue-by-issue status (feature branch)
 
-| Issue                                   | Ticket ask                          | Actual status                                                                                                                                                |
-| --------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **A** ISO dates                         | `strftime("%B %-d, %Y")` everywhere | ✅ Done via Django `date_format("F j, Y")` + `format_leave_date` at call sites                                                                               |
-| **B** Raw `datetime.date(...)` in spans | `format_span_list` utility          | ✅ Done via `format_span_output_message`, `format_expression_result`, span helpers                                                                           |
-| **C** Raw `Decimal(...)`                | Format or hide                      | ⚠️ Partial — `paycalc_item_template_overrides` filtered as internal; `_format_expression_value` still uses `str()` for Decimal (shows `10.00`, not `$10.00`) |
-| **D** Raw `<Span ...>` repr             | Span formatters                     | ✅ Done via `_is_span_like` + `format_span_range`                                                                                                            |
-| **E** Raw timedelta `0:00:00`           | `format_duration`                   | ✅ Done; company policy min-time-off uses `format_company_policy_min_time_off_not_met_message`                                                               |
-| Sentinels                               | "Not determined" / omit             | ✅ `is_sentinel_date`, `should_suppress_reason`, `format_effective_date`                                                                                     |
-| Duration units lowercase                | weeks not WEEK                      | ✅ `format_company_policy_min_time_off_not_met_message`, `days_to_weeks_phrase`                                                                              |
-| Shared utility                          | New formatting.py                   | ✅ **`reasoning_format.py`** (do not duplicate)                                                                                                              |
+| Issue | Ticket ask | Branch status |
+|-------|-----------|---------------|
+| **A** ISO dates | Human-readable everywhere | ⚠️ **Maine PFML** still uses raw `date` in `%` formatting → ISO |
+| **B** Raw `datetime.date(...)` spans | Span formatters | ✅ Done |
+| **C** Raw `Decimal(...)` | Format or hide | ⚠️ `_format_expression_value` uses `str()`; `paycalc_item_template_overrides` filtered as internal |
+| **D** Raw `<Span ...>` | Span formatters | ✅ Done |
+| **E** Raw timedelta `0:00:00` | `format_duration` | ✅ Done |
+| Sentinels | Hide / "Not applicable" | ✅ `is_sentinel_date`, `should_suppress_reason`, `format_effective_date` |
+| Duration units lowercase | weeks not WEEK | ✅ tenure + company policy helpers |
+| Shared utility | New formatting.py | ✅ **`reasoning_format.py`** only |
 
 ---
 
 ## Remaining work (ordered)
 
-### Phase 1 — Verify branch completeness (read-only audit)
-
-Run these greps on `pie-121-humanize-span-messages` and confirm **zero hits in
-production reasoning paths** (tests/comments OK):
+### Phase 0 — Checkout
 
 ```bash
-# Raw Python reprs in reason() paths (exclude tests)
-rg 'datetime\.date\(|Decimal\(|<Span ' backend/benefits/rules --glob '!**/tests/**'
-
-# ISO dates in f-string reason calls (should be none)
-rg 'self\.reason\(f["\']' backend/benefits/rules --glob '!**/tests/**'
-
-# Unformatted expression descriptions still embedding dates
-rg '\d{4}-\d{2}-\d{2}' backend/benefits/rules --glob '!**/tests/**' --glob '!**/reasoning_format.py'
+git fetch origin
+git checkout pie-121-humanize-span-messages
+git pull --ff-only origin pie-121-humanize-span-messages
 ```
 
-Manual spot-check categories in a real leave evaluation:
+### Phase 1 — Audit (on feature branch only)
 
-- `reasoning.spans`
-- `reasoning.eligible` / tenure messages
-- `reasoning.max_duration`
-- Legacy FMLA `eligibility_desc` via API/serializer
+```bash
+# Raw reprs in production reasoning (exclude tests)
+rg 'datetime\.date\(|Decimal\(|<Span ' backend/benefits/rules --glob '!**/tests/**'
 
-### Phase 2 — Close known gaps
+# ISO dates from raw date interpolation in reason() (should be zero after Maine fix)
+rg 'self\.reason\(|rule\.reason\(' backend/benefits/rules --glob '!**/tests/**' -l | \
+  xargs rg '\%\).*date|isoformat\(\)'
 
-1. **Decimal formatting in `_format_expression_value`** (`reasoning_format.py`
-   ~L426–442)\
-   Add explicit `Decimal` handling if expression results ever surface to users:
-   ```python
-   from decimal import Decimal
-   if isinstance(value, Decimal):
-       return f"${value:.2f}"  # or locale-aware if project has a money helper
-   ```
-   Low priority while `paycalc_item_template_overrides` stays internal-only.
+# Confirm __init__.py is clean (should return nothing on branch)
+rg '\.isoformat\(\)' backend/benefits/rules/__init__.py
 
-2. **`should_suppress_reason` vs human-readable sentinels**\
-   Suppression keys off ISO strings (`0001-01-01`). After humanization,
-   intermediate reasons should not contain ISO dates anyway. Confirm no
-   regressions where formatted "Not applicable" messages get dropped
-   incorrectly.
+# Maine PFML — known remaining hits at ~L527-553
+rg 'self\.reason' backend/benefits/rules/maine/pfml.py -n
+```
 
-3. **Frontend regex fallback** (`date-span-processor.ts`)\
-   Legacy regex expects `(YYYY,M,D)` tuples in reasoning text. Human-readable
-   copy uses structured `result.spans` first — verify multi-span paycalc
-   splitting still works when only reasoning text is available (edge case).
-   Tests exist in `date-span-processor.test.ts`; extend if a gap is found.
+**Manual spot-check** serialized API reasoning (not raw `result.reasoning`):
 
-4. **`Suggested: {reason}` in `__init__.py` L4114**\
-   Audit whether suggestion text can contain raw reprs from upstream.
+- `reasoning.spans`, `reasoning.eligible`, legacy FMLA `eligibility_desc`
+- Empty-span UI via `format-empty-span-summary.ts`
 
-### Phase 3 — Test & CI
+### Phase 2 — Fix remaining gaps
+
+#### 2a. Maine PFML (CRITICAL — only confirmed ISO leak on branch)
+
+File: `backend/benefits/rules/maine/pfml.py` (~L527–553)
+
+Replace raw `% {"start_date": start_date}` / `due_date` / `end_date` with existing helpers (same pattern as Colorado FAMLI):
+
+| Current inline copy | Use instead |
+|---------------------|-------------|
+| Medical pre-birth start on leave date | `format_medical_pre_birth_start_on_leave_date_message(start_date)` |
+| Earliest start is due date | `format_earliest_start_is_due_date_message(leave.expected_due_date)` |
+| Parental bonding end within one year | `format_parental_bonding_must_end_by_message(end_date)` |
+
+Add/adjust tests in `backend/benefits/rules/maine/tests/` if present.
+
+#### 2b. Decimal in `_format_expression_value` (LOW — optional)
+
+`reasoning_format.py` ~L426–442: add explicit `Decimal` branch if non-internal expression results need currency formatting. Do **not** use bare `$value:.2f` without confirming money conventions. Safe to defer while paycalc overrides stay internal-only per `results.py`.
+
+#### 2c. Paycalc operator reasoning (LOW — optional)
+
+`__init__.py` paycalc `add`/`multiply`/etc. append `"= " + str(Decimal)`. Avoids `Decimal(` repr but not centralized. Route through `_format_expression_value` only if these messages become user-visible.
+
+#### 2d. Frontend regex fallback (document, don't necessarily fix)
+
+If API always provides `result.spans` (serializer includes structured spans), humanized reasoning-only text is fine. Add a test documenting **degraded** behavior when `result.spans` is empty and reasoning is human-readable (multi-span paycalc splitting may not run). Confirm serializer contract in `backend/benefits/serializers.py`.
+
+#### 2e. Refresh stale test fixtures (MEDIUM)
+
+`backend/benefits/services/tests/test_results.py` may still use raw `<Span ...>` fixtures — update to humanized strings or scope tests to filtering behavior only.
+
+### Phase 3 — Tests & CI
 
 Follow `@.ai/rules/testing/testing-standards.mdc`:
 
 ```bash
-# Backend (from repo root, use project venv/docker as usual)
 pytest backend/benefits/rules/tests/test_reasoning_format.py -q
 pytest backend/benefits/rules/tests/test_base_classes.py -q -k reasoning
+pytest backend/benefits/services/tests/test_results.py -q
+pytest backend/benefits/tests/test_serializers.py -q -k reasoning
 pytest backend/legacy/tests/test_fmla.py -q -k hire
 
-# Frontend
+# Frontend (from frontend/client or repo frontend root per project convention)
 npm test -- --testPathPattern='date-span-processor|format-empty-span-summary|EligibleBenefitsSection'
 ```
 
-Fix any failing assertions on the branch; re-run full PR checks via
-`gh pr checks 11928`.
+Optional integration assertion: serialized `reasoning` contains no `\d{4}-\d{2}-\d{2}` pattern.
 
-### Phase 4 — PR merge
+```bash
+gh pr checks 11928
+```
 
-- Resolve any CI failures (recent main merges may have introduced conflicts).
-- Confirm frontend mock data matches new reasoning shape.
-- Request review; merge #11928.
+### Phase 4 — Merge PR #11928
 
----
-
-## Files reference (ticket vs reality)
-
-| Ticket said                                  | Actually changed / use instead                                         |
-| -------------------------------------------- | ---------------------------------------------------------------------- |
-| `backend/benefits/utils/formatting.py` (new) | **`backend/benefits/rules/reasoning_format.py`** (exists, 2300+ lines) |
-| `backend/benefits/rules/__init__.py`         | ✅ Framework hooks + span/denial/max-duration messages                 |
-| `backend/legacy/fmla.py`                     | ✅ `_hire_date_eligibility_message`, `_format_long_date`               |
-| `backend/benefits/rules/checks/employee.py`  | ✅ Uses `messages.tenure_before_leave_return` (lowercase units)        |
-| State rule files (CA, OR, WA, …)             | ✅ Bulk-updated across ~40 rule files on branch                        |
-| `checks/messages.py`                         | ✅ `format_leave_date`, tenure messages, hours-worked dates            |
+- Fix Maine PFML + any CI failures
+- Confirm frontend mocks match reasoning shape
+- Merge when green
 
 ---
 
 ## Conventions for new/edited copy
 
-1. **Never** interpolate raw `date`, `Span`, `timedelta`, or `Decimal` into
-   `self.reason()` / `describe()` strings.
-2. **Prefer** an existing `format_*_message()` in `reasoning_format.py`; add a
-   new one only when copy is genuinely program-specific (see module docstring).
-3. **Do not** add pass-through aliases that only rename existing helpers.
-4. **Use** `format_expression_result()` only via the framework (or tests
-   documenting expected output).
-5. **Sentinel dates:** return `None` from
-   `format_minimum_effective_date_message` etc. to omit, or "Not applicable" /
-   dedicated unknown-span messages.
-6. **i18n:** wrap user-facing strings in `_()`; `%` formatting with named
-   placeholders.
-7. **Tests:** one behavior per test, assert full expected string (see
-   `test_reasoning_format.py`).
+1. **Never** interpolate raw `date`, `Span`, `timedelta`, or `Decimal` into `self.reason()` / `describe()` strings.
+2. **Prefer** existing `format_*_message()` in `reasoning_format.py`; add new ones only for genuinely program-specific copy (see module docstring — no pass-through aliases).
+3. **Sentinel dates:** omit via helpers returning `None`, or use **"Not applicable"** / dedicated unknown-span messages — never January 1, 0001.
+4. **i18n:** `_()` + named `%` placeholders.
+5. **Tests:** one behavior per test; assert full expected string (`test_reasoning_format.py`).
 
 ---
 
 ## Acceptance criteria checklist
 
-- [ ] No `YYYY-MM-DD` in user-facing reasoning
+- [ ] No `YYYY-MM-DD` in user-facing reasoning (API via `get_user_facing_reasoning`)
 - [ ] No `datetime.date(...)` reprs
 - [ ] No `Decimal(...)` reprs in visible reasoning
 - [ ] No `<Span ...>` reprs
 - [ ] No `0:00:00` timedelta noise
-- [ ] Sentinel dates show "Not applicable" / omitted / "No leave periods" —
-      never January 1, 0001
+- [ ] Sentinel dates → "Not applicable" / omitted / "No leave periods" — never year 0001
 - [ ] Duration units lowercase in user copy
-- [ ] Shared helpers in `reasoning_format.py` (not duplicated)
-- [ ] Backend + frontend tests green
-- [ ] PR #11928 merged
+- [ ] Shared helpers in `reasoning_format.py` (no duplicate module)
+- [ ] Maine PFML parental date messages humanized
+- [ ] Backend + frontend tests green; PR #11928 merged
 
 ---
 
 ## Out of scope
 
-- Rewriting all eligibility check `desc` strings (separate humanization effort
-  may exist).
-- Changing non-reasoning logs, admin output, or test assertion comments with ISO
-  dates.
-- Creating `backend/benefits/utils/formatting.py` (would duplicate
-  `reasoning_format.py`).
+- `FMLAReasoning.to_dict()` ISO fields (API JSON contract)
+- Non-reasoning logs, admin output, test comment ISO dates
+- Creating `backend/benefits/utils/formatting.py`
+- Rewriting all eligibility `desc` strings (separate effort)
 
 ---
 
 ## Agent handoff prompt
 
-Copy everything below into a **new Cursor session** to continue this work:
+Copy into a **new Cursor session**:
 
 ```
 Also read AGENTS.local.md if present.
 
-Implement/verify PIE-121 (human-readable benefit reasoning) following the plan at:
+Implement/verify PIE-121 following the plan at:
   ai-docs/pie-121-human-readable-reasoning-plan.md
-(that directory is gitignored — local only, not on GitHub)
+(ai-docs/ is gitignored — local only, not on GitHub)
+
+Start by checking out the feature branch:
+  git checkout pie-121-humanize-span-messages
 
 Context:
-- Branch: pie-121-humanize-span-messages
-- PR: #11928 (mostly complete; verify + merge)
+- PR #11928 — mostly complete; Maine PFML is the main remaining ISO date leak
 - Shared formatters: backend/benefits/rules/reasoning_format.py
 - Date format: checks/messages.format_leave_date → Django "F j, Y"
 - Do NOT create backend/benefits/utils/formatting.py
+- main does NOT have this work — always work on pie-121-humanize-span-messages
 
-Your tasks:
-1. Check out pie-121-humanize-span-messages and read the plan.
-2. Run the Phase 1 audit greps; fix any remaining raw reprs/ISO dates in reasoning paths.
-3. Close Phase 2 gaps if found (Decimal in _format_expression_value, frontend regex edge cases).
-4. Run Phase 3 tests; fix failures.
-5. Confirm gh pr checks 11928 pass; summarize remaining blockers for merge.
+Tasks:
+1. Read the plan in ai-docs/.
+2. Fix Maine PFML (~L527-553) using existing format_* helpers from reasoning_format.py.
+3. Run Phase 1 audit greps; fix any other raw reprs/ISO dates found.
+4. Run Phase 3 tests (including test_results.py, test_serializers.py); fix failures.
+5. Confirm gh pr checks 11928 pass; summarize merge blockers.
 
 Follow @.ai/README.md, @.ai/rules/backend/backend-quality-standards.mdc, and @.ai/rules/testing/testing-standards.mdc.
 Do not commit unless I ask.
@@ -266,6 +247,7 @@ Do not commit unless I ask.
 
 ## Revision history
 
-| Date       | Author       | Notes                         |
-| ---------- | ------------ | ----------------------------- |
-| 2026-09-15 | Cursor agent | Initial plan; branch/PR audit |
+| Date | Author | Notes |
+|------|--------|-------|
+| 2026-09-15 | Cursor agent | Initial plan |
+| 2026-09-15 | Cursor agent | Subagent review: corrected branch vs main; Maine PFML gap; gitignore; audit greps |
